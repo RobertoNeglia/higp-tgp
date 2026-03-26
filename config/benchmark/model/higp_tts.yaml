@@ -14,6 +14,7 @@ model:
     single_sample: True
     skip_connection: False
     mode: gated
+    pooler: gumbel
     temp_decay: 0.99995
 
 dataset:

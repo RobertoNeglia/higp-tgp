@@ -1,97 +1,215 @@
 import math
+from typing import Optional
 
 import torch
-from einops import repeat
-from torch import nn
+from torch import Tensor, nn
 from torch.nn import functional as F
 
 import tsl
-from lib.nn.hierarchical.ops import src_reduce, src_connect
+from tgp.connect import DenseConnect
+from tgp.lift import BaseLift
+from tgp.reduce import BaseReduce
+from tgp.select import Select, SelectOutput
+from tgp.src import DenseSRCPooling, PoolingOutput
+from tgp.utils.losses import mincut_loss, orthogonality_loss
+from tgp.utils.ops import postprocess_adj_pool_dense
 from tsl.nn.layers.base import NodeEmbedding
 
-def _rank3_trace(x):
-    return torch.einsum('...jj->...', x)
 
-class MinCutPool(nn.Module):
-    def __init__(self,
-                 emb_size: int,
-                 n_nodes,
-                 n_clusters,
-                 hard=True,
-                 temp: float = 1.0,
-                 temp_decay: float = 0.99995):
-        super(MinCutPool, self).__init__()
-        self.in_channels = emb_size
-        self.n_clusters = n_clusters
+class NodeEmbeddingSelect(Select):
+    """Dense select operator using a prior learnable node embedding matrix
+    with Gumbel-Softmax sampling during training.
+
+    Unlike :class:`~tgp.select.MLPSelect`, the assignment logits are
+    position-dependent (one learnable vector per node) rather than
+    feature-dependent. At training time, Gumbel-Softmax produces
+    (optionally hard) one-hot-like samples; at test time, either argmax
+    (hard) or plain softmax is used.
+    """
+
+    is_dense: bool = True
+
+    def __init__(
+        self,
+        n_nodes: int,
+        k: int,
+        hard: bool = True,
+        temp: float = 1.0,
+        temp_decay: float = 0.99995,
+        temp_min: float = 0.05,
+        s_inv_op: str = "transpose",
+    ):
+        super().__init__()
+        self.k = k
+        self.hard = hard
         self._temp = temp
         self.temp_decay = temp_decay
-        self.hard = hard
+        self.temp_min = temp_min
+        self.s_inv_op = s_inv_op
 
-        self.assigment_logits = NodeEmbedding(n_nodes=n_nodes, emb_size=n_clusters)
+        self.assignment_logits = NodeEmbedding(n_nodes=n_nodes, emb_size=k)
 
-    def get_temp(self):
-        if self.training:
-            self._temp = max(self._temp * self.temp_decay, 0.05)
+    def reset_parameters(self):
+        self.assignment_logits.reset_emb()
+
+    @property
+    def temp(self) -> float:
         return self._temp
 
-    def compute_regularizations(self, s_soft, adj):
-        """
-        Compute MinCut and Orthogonality regularizations with soft assignment.
-        """
-        # MinCut regularization with soft assignment.
-        # assert adj.dim() == 2, 'Adjacency matrix must be 2D'
+    def anneal_temperature(self):
+        """Decay temperature by one step (call once per forward during training)."""
+        self._temp = max(self._temp * self.temp_decay, self.temp_min)
 
-        mincut_num = _rank3_trace(src_connect(adj, s_soft))
-        d_flat = torch.sum(adj, dim=-1)
-        d = torch.diag_embed(d_flat)
-        mincut_den = _rank3_trace(src_connect(d, s_soft))
-        mincut_loss = -(mincut_num / mincut_den)
-        mincut_loss = torch.mean(mincut_loss)
+    def forward(
+        self,
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+        batch: Optional[Tensor] = None,
+        **kwargs,
+    ) -> SelectOutput:
+        logits = self.assignment_logits()  # [N, K]
 
-        # Orthogonality regularization with soft assignment.
-        ss = torch.matmul(s_soft.transpose(-2, -1), s_soft)
-        i_s = torch.eye(self.n_clusters).type_as(ss)
-        ortho_loss = torch.norm(
-            ss / torch.norm(ss, dim=(-1, -2), keepdim=True) -
-            i_s / math.sqrt(self.n_clusters), dim=(-1, -2))
-        ortho_loss = torch.mean(ortho_loss)
-        return mincut_loss, ortho_loss
-
-    def forward(self, emb, adj):
-        logits = self.assigment_logits()
-
-        if emb.dim() == 3:
-            logits = repeat(logits, 'n k -> b n k', b=emb.size(0))
+        # Expand for batched input [B, N, F] -> logits [B, N, K]
+        if x.dim() == 3:
+            logits = logits.unsqueeze(0).expand(x.size(0), -1, -1)
 
         if self.training:
-            s_sample = F.gumbel_softmax(logits / self.get_temp(),
-                                      hard=self.hard,
-                                      dim=-1)
+            self.anneal_temperature()
+            s = F.gumbel_softmax(logits / self._temp, hard=self.hard, dim=-1)
         else:
             if self.hard:
-                s_sample = F.one_hot(torch.argmax(logits, dim=-1),
-                                     num_classes=self.n_clusters).float()
+                s = F.one_hot(
+                    torch.argmax(logits, dim=-1),
+                    num_classes=self.k,
+                ).float()
             else:
-                s_sample = F.softmax(logits / self.get_temp(), dim=-1)
+                s = F.softmax(logits / self._temp, dim=-1)
 
-        s_sample += tsl.epsilon
-        s_soft = F.softmax(self.assigment_logits() / self.get_temp(), dim=-1)
+        # Prevent exact zeros in the assignment matrix. Downstream,
+        # compute_aggregation_matrix cascades these matrices via matmul;
+        # exact zeros can produce all-zero rows in C, making the
+        # reconciliation matrix Q singular (lstsq / SVD failure).
+        s = s + tsl.epsilon
 
-        if self.training:
-            min_cut_loss, ortho_loss = self.compute_regularizations(s_soft, adj)
-        else:
-            min_cut_loss = ortho_loss = 0.
+        if mask is not None:
+            s = s * mask.unsqueeze(-1)
 
-        # Compute the new node embeddings
-        out_emb = src_reduce(emb, s_sample)
-        # Compute the coarsened adjacency matrix
-        out_adj = src_connect(adj, s_sample)
+        return SelectOutput(s=s, s_inv_op=self.s_inv_op, in_mask=mask)
 
-        # Fix and normalize coarsened adjacency matrix.
-        ind = torch.arange(self.n_clusters, device=out_adj.device)
-        out_adj[..., ind, ind] = 0.
-        d = out_adj.sum(dim=-1, keepdim=True)
-        d = torch.sqrt(d) + tsl.epsilon
-        out_adj = (out_adj / d) / d.transpose(-2, -1)
 
-        return out_emb, out_adj, s_sample, (min_cut_loss, ortho_loss)
+class GumbelMinCutPooling(DenseSRCPooling):
+    """MinCut pooling with prior learnable node embeddings and Gumbel-Softmax.
+
+    This reproduces the original assignment mechanism (position-dependent
+    logits + Gumbel-Softmax + temperature annealing) within the TGP
+    Select-Reduce-Connect framework, keeping the MinCut and orthogonality
+    regularisation losses.
+    """
+
+    def __init__(
+        self,
+        n_nodes: int,
+        k: int,
+        hard: bool = True,
+        temp: float = 1.0,
+        temp_decay: float = 0.99995,
+        temp_min: float = 0.05,
+        cut_loss_coeff: float = 1.0,
+        ortho_loss_coeff: float = 1.0,
+        remove_self_loops: bool = True,
+        degree_norm: bool = True,
+        adj_transpose: bool = False,
+    ):
+        selector = NodeEmbeddingSelect(
+            n_nodes=n_nodes,
+            k=k,
+            hard=hard,
+            temp=temp,
+            temp_decay=temp_decay,
+            temp_min=temp_min,
+        )
+        super().__init__(
+            selector=selector,
+            reducer=BaseReduce(),
+            lifter=BaseLift(matrix_op="precomputed"),
+            connector=DenseConnect(
+                remove_self_loops=remove_self_loops,
+                degree_norm=degree_norm,
+                adj_transpose=adj_transpose,
+            ),
+            adj_transpose=adj_transpose,
+            batched=True,
+            sparse_output=False,
+        )
+
+        self.cut_loss_coeff = cut_loss_coeff
+        self.ortho_loss_coeff = ortho_loss_coeff
+
+    def compute_loss(self, adj, s, adj_pool) -> dict:
+        """MinCut + orthogonality losses computed on the *soft* assignment."""
+        # For loss computation, use a softmax of the raw logits (no Gumbel noise)
+        # to get a smooth gradient signal, same as the original implementation.
+        raw_logits = self.selector.assignment_logits()  # [N, K]
+        if s.dim() == 3:
+            raw_logits = raw_logits.unsqueeze(0).expand(s.size(0), -1, -1)
+        s_soft = F.softmax(raw_logits / self.selector.temp, dim=-1)
+
+        adj_soft = self.connector.dense_connect(adj=adj, s=s_soft)
+        cut = mincut_loss(adj, s_soft, adj_soft) * self.cut_loss_coeff
+        ortho = orthogonality_loss(s_soft) * self.ortho_loss_coeff
+        return {"cut_loss": cut, "ortho_loss": ortho}
+
+    def forward(
+        self,
+        x: Tensor,
+        adj: Optional[Tensor] = None,
+        edge_weight: Optional[Tensor] = None,
+        so: Optional[SelectOutput] = None,
+        mask: Optional[Tensor] = None,
+        batch: Optional[Tensor] = None,
+        batch_pooled: Optional[Tensor] = None,
+        lifting: bool = False,
+        **kwargs,
+    ) -> PoolingOutput:
+        if lifting:
+            batch_orig = batch if batch is not None else so.batch
+            return self.lift(
+                x_pool=x, so=so, batch=batch_orig, batch_pooled=batch_pooled
+            )
+
+        # Ensure dense batched inputs
+        x, adj, mask = self._ensure_batched_inputs(
+            x=x,
+            edge_index=adj,
+            edge_weight=edge_weight,
+            batch=batch,
+            mask=mask,
+        )
+
+        # Select (Gumbel-Softmax on node embedding logits)
+        so = self.select(x=x, mask=mask)
+
+        # Reduce: S^T @ X
+        x_pooled, batch_pooled = self.reduce(x=x, so=so, batch=batch)
+
+        # Connect: S^T @ A @ S
+        adj_pool = self.connector.dense_connect(adj=adj, s=so.s)
+
+        # Loss (uses soft assignment, not the Gumbel sample)
+        loss = self.compute_loss(adj, so.s, adj_pool) if self.training else {}
+
+        # Post-process adjacency (remove self-loops, degree normalize)
+        adj_pool = postprocess_adj_pool_dense(
+            adj_pool,
+            remove_self_loops=self.connector.remove_self_loops,
+            degree_norm=self.connector.degree_norm,
+            adj_transpose=self.connector.adj_transpose,
+        )
+
+        return PoolingOutput(
+            x=x_pooled,
+            edge_index=adj_pool,
+            batch=batch_pooled,
+            so=so,
+            loss=loss,
+        )

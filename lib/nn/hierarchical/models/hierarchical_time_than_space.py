@@ -16,23 +16,28 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
     return_type = tuple
 
     r""""""
-    def __init__(self,
-                 input_size: int,
-                 horizon: int,
-                 n_nodes: int,
-                 hidden_size: int,
-                 emb_size: int,
-                 levels: int,
-                 n_clusters: int,
-                 single_sample: bool,
-                 skip_connection: bool = False,
-                 output_size: int = None,
-                 ff_size: int = None,
-                 rnn_size: int = None,
-                 exog_size: int = 0,
-                 temporal_layers: int = 1,
-                 temp_decay: float = 0.5,
-                 activation: str = 'silu'):
+
+    def __init__(
+        self,
+        input_size: int,
+        horizon: int,
+        n_nodes: int,
+        hidden_size: int,
+        emb_size: int,
+        levels: int,
+        n_clusters: int,
+        single_sample: bool,
+        skip_connection: bool = False,
+        pooler: str = "gumbel",
+        hard: bool = True,
+        temp_decay: float = 0.99995,
+        output_size: int = None,
+        ff_size: int = None,
+        rnn_size: int = None,
+        exog_size: int = 0,
+        temporal_layers: int = 1,
+        activation: str = "silu",
+    ):
         super(HierarchicalTimeThanSpaceModel, self).__init__()
 
         self.input_size = input_size
@@ -45,12 +50,11 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
         self.emb = NodeEmbedding(n_nodes=n_nodes, emb_size=emb_size)
         rnn_size = rnn_size or hidden_size
 
-
         self.input_encoder = HierarchyEncoder(
             input_size=input_size,
             hidden_size=rnn_size,
             exog_size=exog_size,
-            emb_size=emb_size
+            emb_size=emb_size,
         )
 
         self.hierarchy_builder = MinCutHierarchyBuilder(
@@ -58,7 +62,9 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
             hidden_size=emb_size,
             n_clusters=n_clusters,
             n_levels=levels,
-            temp_decay=temp_decay
+            pooler=pooler,
+            temp_decay=temp_decay,
+            hard=hard,
         )
 
         if rnn_size != hidden_size:
@@ -67,14 +73,14 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
                 hidden_size=rnn_size,
                 output_size=hidden_size,
                 return_only_last_state=True,
-                n_layers=temporal_layers
+                n_layers=temporal_layers,
             )
         else:
             self.temporal_encoder = RNN(
                 input_size=hidden_size,
                 hidden_size=hidden_size,
                 return_only_last_state=True,
-                n_layers=temporal_layers
+                n_layers=temporal_layers,
             )
 
         decoder_input_size = hidden_size + emb_size
@@ -82,13 +88,18 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
             decoder_input_size += rnn_size
 
         ff_size = ff_size or hidden_size
-        self.decoders = nn.ModuleList([MLPDecoder(
-            input_size=decoder_input_size,
-            output_size=self.output_size,
-            horizon=horizon,
-            hidden_size=ff_size,
-            activation=activation,
-        ) for _ in range(self.levels)])
+        self.decoders = nn.ModuleList(
+            [
+                MLPDecoder(
+                    input_size=decoder_input_size,
+                    output_size=self.output_size,
+                    horizon=horizon,
+                    hidden_size=ff_size,
+                    activation=activation,
+                )
+                for _ in range(self.levels)
+            ]
+        )
 
     def hierarchical_message_passing(self, x, **kwargs):
         raise NotImplementedError
@@ -97,37 +108,31 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
         """"""
         emb = self.emb()
         if self.training and not self.single_sample:
-            emb = repeat(emb, 'n f -> b n f', b=x.size(0))
+            emb = repeat(emb, "n f -> b n f", b=x.size(0))
 
         # extract hierarchy
-        embs, \
-        adjs, \
-        selects, \
-        sizes, \
-        reg_losses = self.hierarchy_builder(emb,
-                                            edge_index=edge_index,
-                                            edge_weight=edge_weight)
+        embs, adjs, selects, sizes, reg_losses = self.hierarchy_builder(
+            emb, edge_index=edge_index, edge_weight=edge_weight
+        )
 
         aggregation_matrix = compute_aggregation_matrix(selects)
 
         # temporal encoding
         # weights are shared across levels
-        x = self.input_encoder(x=x,
-                               u=u,
-                               embs=embs,
-                               selects=selects,
-                               cat_output=True)
+        x = self.input_encoder(x=x, u=u, embs=embs, selects=selects, cat_output=True)
 
         x = self.temporal_encoder(x)
         xs = list(torch.split(x, sizes, dim=-2))
 
-        outs = self.hierarchical_message_passing(x=xs,
-                                                 adjs=adjs,
-                                                 selects=selects,
-                                                 edge_index=edge_index,
-                                                 edge_weight=edge_weight,
-                                                 aggregation_matrix=aggregation_matrix,
-                                                 sizes=sizes)
+        outs = self.hierarchical_message_passing(
+            x=xs,
+            adjs=adjs,
+            selects=selects,
+            edge_index=edge_index,
+            edge_weight=edge_weight,
+            aggregation_matrix=aggregation_matrix,
+            sizes=sizes,
+        )
 
         for i in range(self.levels):
             outs[i] = maybe_cat_emb(outs[i], embs[i])
@@ -142,7 +147,4 @@ class HierarchicalTimeThanSpaceModel(BaseModel):
 
         out = torch.cat(outs[::-1], dim=-2)
 
-        return out, \
-               aggregation_matrix, \
-               sizes[::-1], \
-               reg_losses
+        return out, aggregation_matrix, sizes[::-1], reg_losses

@@ -23,22 +23,11 @@ class MaskedPinballLoss(MaskedMetric):
     higher_is_better: bool = False
     full_state_update: bool = False
 
-    def __init__(self,
-                 q,
-                 mask_nans=False,
-                 mask_inf=False,
-                 compute_on_step=True,
-                 dist_sync_on_step=False,
-                 process_group=None,
-                 dist_sync_fn=None,
-                 at=None):
-        super(MaskedPinballLoss,
-              self).__init__(metric_fn=pinball_loss,
-                             mask_nans=mask_nans,
-                             mask_inf=mask_inf,
-                             compute_on_step=compute_on_step,
-                             dist_sync_on_step=dist_sync_on_step,
-                             process_group=process_group,
-                             dist_sync_fn=dist_sync_fn,
-                             metric_fn_kwargs={'q': q},
-                             at=at)
+    def __init__(self, q, mask_nans=False, mask_inf=False, at=None):
+        super(MaskedPinballLoss, self).__init__(
+            metric_fn=pinball_loss,
+            mask_nans=mask_nans,
+            mask_inf=mask_inf,
+            metric_fn_kwargs={"q": q},
+            at=at,
+        )
